@@ -29,16 +29,16 @@ struct DropLog {
 }
 
 impl DropLog {
-    fn note(&mut self, what: &str, e: Error) {
+    /// Counts one drop and returns the running count when this one should be logged.
+    fn due(&mut self) -> Option<u64> {
         self.count += 1;
 
-        if self.count.is_power_of_two() {
-            fmt::warn!(
-                "{} failed, frame dropped ({} so far): {}",
-                what,
-                self.count,
-                e
-            );
+        self.count.is_power_of_two().then_some(self.count)
+    }
+
+    fn note(&mut self, what: &str, e: Error) {
+        if let Some(count) = self.due() {
+            fmt::warn!("{} failed, frame dropped ({} so far): {}", what, count, e);
         }
     }
 }
@@ -84,25 +84,25 @@ impl<'a> Future for TxRxFut<'a> {
             }
         }
 
-        while let Some(frame) = unsafe { self.tx.as_mut().unwrap_unchecked() }.next_sendable_frame()
+        let this = &mut *self;
+
+        while let Some(frame) = unsafe { this.tx.as_mut().unwrap_unchecked() }.next_sendable_frame()
         {
+            // Only recorded here: while the link is down every send fails, and logging each one
+            // from the TX/RX thread would flood the log.
+            let mut os_error = None;
+
             let res = frame.send_blocking(|data| {
-                match Pin::new(&mut self.socket).poll_write(ctx, data) {
-                    Poll::Ready(Ok(bytes_written)) => {
-                        if bytes_written != data.len() {
-                            fmt::error!("Only wrote {} of {} bytes", bytes_written, data.len());
-
-                            Err(Error::PartialSend {
-                                len: data.len(),
-                                sent: bytes_written,
-                            })
-                        } else {
-                            Ok(bytes_written)
-                        }
+                match Pin::new(&mut this.socket).poll_write(ctx, data) {
+                    Poll::Ready(Ok(bytes_written)) if bytes_written != data.len() => {
+                        Err(Error::PartialSend {
+                            len: data.len(),
+                            sent: bytes_written,
+                        })
                     }
-
+                    Poll::Ready(Ok(bytes_written)) => Ok(bytes_written),
                     Poll::Ready(Err(e)) => {
-                        fmt::error!("Send PDU failed: {}", e);
+                        os_error = Some(e);
 
                         Err(Error::SendFrame)
                     }
@@ -114,7 +114,18 @@ impl<'a> Future for TxRxFut<'a> {
                 // `send_blocking` put the frame back as sendable. Retry it on the next poll
                 // instead of spinning here; if sending keeps failing, the frame's own timeout
                 // reports it lost. Ending the task would lose `PduTx`/`PduRx` for good.
-                self.tx_drops.note("Send frame", e);
+                if let Some(count) = this.tx_drops.due() {
+                    match os_error {
+                        Some(os) => fmt::warn!(
+                            "Send frame failed, frame dropped ({} so far): {}",
+                            count,
+                            os
+                        ),
+                        None => {
+                            fmt::warn!("Send frame failed, frame dropped ({} so far): {}", count, e)
+                        }
+                    }
+                }
 
                 break;
             }
@@ -253,6 +264,14 @@ mod tests {
             0xdd, 0xcc, 0xbb, 0xaa, // Payload, LE
             0x00, 0x00, // Working counter
         ]
+    }
+
+    #[test]
+    fn drop_log_is_due_on_powers_of_two_only() {
+        let mut drops = DropLog::default();
+        let due: Vec<u64> = (0..9).filter_map(|_| drops.due()).collect();
+        assert_eq!(due, [1, 2, 4, 8]);
+        assert_eq!(drops.count, 9);
     }
 
     #[test]
