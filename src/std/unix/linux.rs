@@ -2,7 +2,7 @@
 //! [https://github.com/embassy-rs/embassy](https://github.com/embassy-rs/embassy/blob/master/examples/std/src/tuntap.rs).
 
 use crate::{
-    ETHERCAT_ETHERTYPE,
+    ETHERCAT_ETHERTYPE, fmt,
     std::unix::{ifreq, ifreq_for},
 };
 use async_io::IoSafe;
@@ -42,9 +42,37 @@ impl RawSocketDesc {
             ifreq: ifreq_for(name),
         };
 
+        self_.bypass_qdisc();
         self_.bind_interface()?;
 
         Ok(self_)
+    }
+
+    /// Sends frames straight to the driver instead of through the kernel's queueing discipline.
+    ///
+    /// With the qdisc, frames sent while the link is down are queued and flushed when it comes
+    /// back. Their late replies then carry PDU indices that may match frames in flight by then,
+    /// so stale process data could be taken as a fresh response. Without it, those frames are
+    /// dropped at once and simply time out.
+    fn bypass_qdisc(&self) {
+        let enable: libc::c_int = 1;
+
+        let res = unsafe {
+            libc::setsockopt(
+                self.lower,
+                libc::SOL_PACKET,
+                libc::PACKET_QDISC_BYPASS,
+                addr_of!(enable).cast(),
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+
+        if res == -1 {
+            fmt::warn!(
+                "PACKET_QDISC_BYPASS unavailable, frames may queue while the link is down: {}",
+                io::Error::last_os_error()
+            );
+        }
     }
 
     fn bind_interface(&mut self) -> io::Result<()> {
